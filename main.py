@@ -331,8 +331,9 @@ async def process_entry(
         return
 
     out_title = clip_lines(summary["title"], max_lines=2, max_chars=60)
-    paragraph1 = clip_lines(summary["paragraph1"], max_lines=3, max_chars=78)
-    paragraph2 = clip_lines(summary["paragraph2"], max_lines=3, max_chars=78)
+    # Leave paragraph wrapping to Telegram's client; only separate the two paragraphs.
+    paragraph1 = re.sub(r"\s+", " ", summary["paragraph1"]).strip()
+    paragraph2 = re.sub(r"\s+", " ", summary["paragraph2"]).strip()
     if not (out_title and paragraph1 and paragraph2):
         raise ValueError("Model returned an empty summary")
     message = (
