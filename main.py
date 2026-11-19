@@ -1,5 +1,6 @@
 import asyncio
 import html
+import io
 import logging
 import os
 import re
@@ -8,12 +9,13 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import feedparser
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
+from PIL import Image, ImageOps
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -143,25 +145,108 @@ async def fetch_article_text(
     session: aiohttp.ClientSession,
     url: str,
     fallback: str,
-) -> str:
+) -> tuple[str, str | None]:
     try:
         async with session.get(url, allow_redirects=True) as response:
             if response.status != 200:
-                return fallback
+                return fallback, None
             body = await response.text(errors="ignore")
         soup = BeautifulSoup(body, "html.parser")
+        image_url = None
+        for selector in (
+            'meta[property="og:image"]',
+            'meta[name="twitter:image"]',
+            'meta[property="twitter:image"]',
+        ):
+            image_meta = soup.select_one(selector)
+            if image_meta and image_meta.get("content"):
+                image_url = urljoin(url, str(image_meta["content"]).strip())
+                break
         for node in soup(["script", "style", "noscript", "svg", "nav", "footer", "header", "aside"]):
             node.decompose()
         article = soup.find("article") or soup
+        if not image_url:
+            image = article.find("img")
+            if image:
+                candidate = image.get("data-src") or image.get("data-lazy-src") or image.get("src")
+                if candidate:
+                    image_url = urljoin(url, str(candidate).strip())
         paragraphs = [
             re.sub(r"\s+", " ", p.get_text(" ", strip=True))
             for p in article.find_all("p")
         ]
         text = "\n".join(p for p in paragraphs if len(p) > 35)
-        return text[:12000] if text else fallback
+        return (text[:12000] if text else fallback), image_url
     except Exception as exc:
         log.info("Article fetch unavailable for %s (%s); using RSS excerpt", url, type(exc).__name__)
-        return fallback
+        return fallback, None
+
+
+def image_url_from_entry(entry: Any, article_url: str) -> str | None:
+    candidates: list[str] = []
+    for key in ("media_content", "media_thumbnail"):
+        for item in entry.get(key, []) or []:
+            if isinstance(item, dict) and item.get("url"):
+                candidates.append(str(item["url"]))
+    for item in entry.get("enclosures", []) or []:
+        if isinstance(item, dict) and item.get("href") and str(item.get("type", "")).startswith("image/"):
+            candidates.append(str(item["href"]))
+    for item in entry.get("links", []) or []:
+        if (
+            isinstance(item, dict)
+            and item.get("href")
+            and (item.get("rel") == "enclosure" or str(item.get("type", "")).startswith("image/"))
+        ):
+            candidates.append(str(item["href"]))
+    for key in ("summary", "description"):
+        markup = str(entry.get(key, "") or "")
+        soup = BeautifulSoup(markup, "html.parser")
+        img = soup.find("img")
+        if img:
+            candidate = img.get("data-src") or img.get("src")
+            if candidate:
+                candidates.append(str(candidate))
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if candidate and not candidate.startswith("data:"):
+            return urljoin(article_url, candidate)
+    return None
+
+
+async def download_article_image(session: aiohttp.ClientSession, image_url: str) -> tuple[bytes, str]:
+    async with session.get(image_url, allow_redirects=True) as response:
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if not content_type.startswith("image/"):
+            raise ValueError(f"Article image URL did not return an image ({content_type or 'unknown content type'})")
+        max_image_bytes = 10 * 1024 * 1024
+        if response.content_length and response.content_length > max_image_bytes:
+            raise ValueError("Article image is larger than Telegram's 10 MB photo limit")
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            received += len(chunk)
+            if received > max_image_bytes:
+                raise ValueError("Article image is larger than Telegram's 10 MB photo limit")
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        if not payload or len(payload) > 10 * 1024 * 1024:
+            raise ValueError("Article image is empty or larger than Telegram's 10 MB photo limit")
+    try:
+        with Image.open(io.BytesIO(payload)) as original:
+            image = ImageOps.exif_transpose(original)
+            if image.mode not in ("RGB", "L"):
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            elif image.mode == "L":
+                image = image.convert("RGB")
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=90, optimize=True)
+            return output.getvalue(), "image/jpeg"
+    except Exception as exc:
+        raise ValueError(f"Could not decode the source article image: {exc}") from exc
 
 
 class ProcessedStore:
@@ -286,22 +371,24 @@ async def telegram_send(
     session: aiohttp.ClientSession,
     token: str,
     destination: str,
-    text: str,
+    caption: str,
+    photo: bytes,
+    mime_type: str,
 ) -> None:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    async with session.post(
-        url,
-        json={
-            "chat_id": destination,
-            "text": text,
-            "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": True},
-        },
-    ) as response:
+    if len(caption) > 1024:
+        raise ValueError("Formatted photo caption exceeds Telegram's 1024-character limit")
+    extension = "jpg" if mime_type in ("image/jpeg", "image/jpg") else mime_type.split("/", 1)[-1]
+    form = aiohttp.FormData()
+    form.add_field("chat_id", destination)
+    form.add_field("photo", photo, filename=f"article-image.{extension}", content_type=mime_type)
+    form.add_field("caption", caption)
+    form.add_field("parse_mode", "HTML")
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    async with session.post(url, data=form) as response:
         data = await response.json(content_type=None)
         if response.status != 200 or not data.get("ok"):
-            description = str(data.get("description", "Telegram sendMessage failed"))
-            raise RuntimeError(f"Telegram Bot API error ({response.status}): {description}")
+            description = str(data.get("description", "Telegram sendPhoto failed"))
+            raise RuntimeError(f"Telegram Bot API sendPhoto error ({response.status}): {description}")
 
 
 async def process_entry(
@@ -319,7 +406,13 @@ async def process_entry(
         return
 
     excerpt = article_text_from_feed(entry)
-    article = await fetch_article_text(session, link, excerpt or title)
+    article, page_image_url = await fetch_article_text(session, link, excerpt or title)
+    image_url = page_image_url or image_url_from_entry(entry, link)
+    if not image_url:
+        store.mark(link, source, "no_image")
+        log.info("Skipped article without a source image from %s: %s", source, title)
+        return
+    photo, image_mime_type = await download_article_image(session, image_url)
     summary = await summarize(ai, source, title, article, store.recent_published_titles())
     if summary["is_duplicate"] is True:
         store.mark(link, source, "duplicate")
@@ -342,7 +435,7 @@ async def process_entry(
         f"{html.escape(paragraph2)}\n\n"
         f"<b>🆔 @pixelmediair</b>"
     )
-    await telegram_send(session, BOT_TOKEN, DESTINATION, message)
+    await telegram_send(session, BOT_TOKEN, DESTINATION, message, photo, image_mime_type)
     store.mark(link, source, "published")
     store.record_published(link, source, out_title.replace("\n", " "))
     log.info("Published game-news summary from %s: %s", source, title)
