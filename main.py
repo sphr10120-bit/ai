@@ -174,6 +174,16 @@ def isolate_latin_runs(value: str) -> str:
     return "\n".join(lines)
 
 
+def format_telegram_title(value: str) -> str:
+    """Prefix every title line with an invisible RTL mark so Telegram aligns it right."""
+    lines = isolate_latin_runs(format_title(value, max_chars_per_line=40)).splitlines()
+    if not lines:
+        return ""
+    lines[0] = "\u200f🟦 " + lines[0]
+    lines[1:] = ["\u200f" + line for line in lines[1:]]
+    return "\n".join(lines)
+
+
 def parse_summary(content: str) -> dict[str, Any]:
     import json
 
@@ -738,7 +748,7 @@ async def process_entry(
         return
 
     # Use the publisher's original headline; never let the model rewrite or duplicate it.
-    out_title = isolate_latin_runs(format_title(title, max_chars_per_line=40))
+    out_title = format_telegram_title(title)
     # Leave paragraph wrapping to Telegram's client; only separate the two paragraphs.
     paragraph1 = isolate_latin_runs(re.sub(r"\s+", " ", summary["paragraph1"]).strip())
     paragraph2 = isolate_latin_runs(re.sub(r"\s+", " ", summary["paragraph2"]).strip())
@@ -749,7 +759,7 @@ async def process_entry(
     if not (out_title and paragraph1 and paragraph2):
         raise ValueError("Model returned an empty summary")
     message = (
-        f"<b>🟦 {html.escape(out_title)}</b>\n\n"
+        f"<b>{html.escape(out_title)}</b>\n\n"
         f"{html.escape(paragraph1)}\n\n"
         f"{html.escape(paragraph2)}\n\n"
         f"<b>🆔 @pixelmediair</b>"
