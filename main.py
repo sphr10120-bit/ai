@@ -556,6 +556,36 @@ async def telegram_send(
             raise RuntimeError(f"Telegram Bot API sendPhoto error ({response.status}): {description}")
 
 
+async def send_format_test_once(session: aiohttp.ClientSession, store: ProcessedStore) -> None:
+    """Temporary one-shot live test; remove this hook after the approved post is sent."""
+    marker = "__approved_format_test_2026_11"
+    if store.has_baseline(marker):
+        return
+    from PIL import ImageDraw, ImageFont
+
+    card = Image.new("RGB", (180, 120), "#101827")
+    draw = ImageDraw.Draw(card)
+    draw.rounded_rectangle((5, 5, 175, 115), radius=12, fill="#123b43", outline="#39d5b3", width=3)
+    font = ImageFont.load_default()
+    draw.text((55, 34), "TEST", font=font, fill="white", stroke_width=1, stroke_fill="white")
+    draw.text((34, 56), "NOT REAL NEWS", font=font, fill="#a9f2df")
+    card = card.resize((1080, 720), Image.Resampling.NEAREST)
+    photo_io = io.BytesIO()
+    card.save(photo_io, format="JPEG", quality=90)
+    photo = photo_io.getvalue()
+
+    title = "تیتر آزمایشی: بازی فرضی «ستاره‌های پیکسلی» معرفی شد"
+    body = "این پیام خبر واقعی نیست؛ فقط برای بررسی چینش تیتر و کپشن ربات منتشر شده است. پس از بررسی نمایش، پیام را حذف می‌کنیم."
+    caption = (
+        f"<b>🟦 {html.escape(format_title(title, max_chars_per_line=40))}</b>\n\n"
+        f"{html.escape(body)}\n\n<b>🆔 @pixelmediair</b>"
+    )
+    await telegram_send(session, BOT_TOKEN, DESTINATION, caption, photo, "image/jpeg")
+    store.db.execute("INSERT OR IGNORE INTO feed_baselines(source) VALUES (?)", (marker,))
+    store.db.commit()
+    log.info("Sent the one-time approved headline-format test post")
+
+
 async def process_entry(
     session: aiohttp.ClientSession,
     ai: AsyncOpenAI,
@@ -648,6 +678,7 @@ async def main() -> None:
             POLL_INTERVAL_SECONDS,
             MODEL,
         )
+        await send_format_test_once(session, store)
 
         while True:
             for source, feed_url in FEEDS.items():
