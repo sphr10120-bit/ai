@@ -46,6 +46,15 @@ def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
 
 
+_BIDI_CONTROLS = re.compile("[\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u206f]")
+_LATIN_RUN = re.compile(r"[A-Za-z0-9]+(?:[ '\u00a0\u2019.-][A-Za-z0-9]+)*")
+
+
+def strip_bidi_controls(value: str) -> str:
+    """Remove publisher/model-supplied direction overrides before formatting text."""
+    return _BIDI_CONTROLS.sub("", value or "")
+
+
 def canonical_url(value: str) -> str:
     """Normalize tracking/query noise so URL variants of one article share a key."""
     parts = urlsplit((value or "").strip())
@@ -75,7 +84,8 @@ def clean_html(value: str) -> str:
     soup = BeautifulSoup(value, "html.parser")
     for node in soup(["script", "style", "noscript", "svg"]):
         node.decompose()
-    return re.sub(r"\s+", " ", html.unescape(soup.get_text(" ", strip=True))).strip()
+    text = html.unescape(soup.get_text(" ", strip=True))
+    return re.sub(r"\s+", " ", strip_bidi_controls(text)).strip()
 
 
 def clip_lines(value: str, max_lines: int, max_chars: int) -> str:
@@ -111,7 +121,10 @@ def clip_lines(value: str, max_lines: int, max_chars: int) -> str:
 
 def format_title(value: str, max_chars_per_line: int = 40) -> str:
     """Keep a Persian headline to two phone-friendly lines without cutting mid-word."""
-    words = re.sub(r"\s+", " ", value or "").strip().split()
+    value = re.sub(r"\s+", " ", strip_bidi_controls(value)).strip()
+    # Treat multiword Latin names as one wrapping unit (e.g. Mass Effect, GTA VI).
+    value = _LATIN_RUN.sub(lambda match: match.group(0).replace(" ", "\u00a0"), value)
+    words = value.split(" ")
     if not words:
         return ""
     lines: list[str] = []
@@ -148,9 +161,16 @@ def format_title(value: str, max_chars_per_line: int = 40) -> str:
 
 
 def isolate_latin_runs(value: str) -> str:
-    """Keep Latin names in their left-to-right order inside Persian RTL text."""
-    pattern = re.compile(r"[A-Za-z0-9]+(?:[ '\u2019.-][A-Za-z0-9]+)*")
-    return pattern.sub(lambda match: "\u2066" + match.group(0) + "\u2069", value or "")
+    """Force an RTL paragraph while isolating embedded Latin names as LTR runs."""
+    text = strip_bidi_controls(value)
+    if not text:
+        return ""
+    # Use a separate RTL isolate for each explicit title line; nested LRI protects Latin names.
+    lines = []
+    for line in text.split("\n"):
+        line = _LATIN_RUN.sub(lambda match: "\u2066" + match.group(0) + "\u2069", line)
+        lines.append("\u2067" + line + "\u2069")
+    return "\n".join(lines)
 
 
 def parse_summary(content: str) -> dict[str, Any]:
