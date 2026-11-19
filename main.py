@@ -175,13 +175,46 @@ def isolate_latin_runs(value: str) -> str:
 
 
 def format_telegram_title(value: str) -> str:
-    """Prefix every title line with an invisible RTL mark so Telegram aligns it right."""
-    lines = isolate_latin_runs(format_title(value, max_chars_per_line=40)).splitlines()
-    if not lines:
+    """Return plain, sanitized headline text with explicit RTL paragraph marks."""
+    title = re.sub(r"\s+", " ", strip_bidi_controls(value)).strip()
+    title = format_title(title, max_chars_per_line=40)
+    if not title:
         return ""
-    lines[0] = "\u200f🟦 " + lines[0]
-    lines[1:] = ["\u200f" + line for line in lines[1:]]
-    return "\n".join(lines)
+    lines = title.splitlines()[:2]
+    lines[0] = "🟦 " + lines[0]
+    # RLM at each line start nudges Telegram's caption renderer to RTL without
+    # nesting Unicode isolate controls inside HTML formatting tags.
+    return "\n".join("\u200f" + line for line in lines)
+
+
+def format_telegram_paragraph(value: str, max_chars: int = 320) -> str:
+    """Normalize a summary paragraph and prevent source-supplied bidi overrides."""
+    text = re.sub(r"\s+", " ", strip_bidi_controls(value)).strip()
+    if len(text) > max_chars:
+        clipped = text[: max_chars - 1].rsplit(" ", 1)[0].rstrip(" ,؛:،")
+        text = (clipped or text[: max_chars - 1]).rstrip() + "…"
+    return text
+
+
+def build_telegram_caption(title: str, paragraph1: str, paragraph2: str) -> str:
+    """Build the complete Telegram HTML caption from escaped plain-text fields."""
+    title_text = format_telegram_title(title)
+    p1 = format_telegram_paragraph(paragraph1)
+    p2 = format_telegram_paragraph(paragraph2)
+    if not (title_text and p1 and p2):
+        raise ValueError("A caption requires a title and exactly two non-empty paragraphs")
+
+    # Keep each semantic block independent. Escaping happens only at the final
+    # serialization boundary, so model/source text cannot create HTML markup.
+    caption = (
+        f"<b>{html.escape(title_text)}</b>\n\n"
+        f"\u200f{html.escape(p1)}\n\n"
+        f"\u200f{html.escape(p2)}\n\n"
+        f"<b>\u200f🆔 @pixelmediair</b>"
+    )
+    if len(caption) > 1024:
+        raise ValueError("Formatted photo caption exceeds Telegram's 1024-character limit")
+    return caption
 
 
 def parse_summary(content: str) -> dict[str, Any]:
@@ -747,23 +780,8 @@ async def process_entry(
         log.info("Filtered non-news article from %s: %s", source, title)
         return
 
-    # Use the publisher's original headline; never let the model rewrite or duplicate it.
-    out_title = format_telegram_title(title)
-    # Leave paragraph wrapping to Telegram's client; only separate the two paragraphs.
-    paragraph1 = isolate_latin_runs(re.sub(r"\s+", " ", summary["paragraph1"]).strip())
-    paragraph2 = isolate_latin_runs(re.sub(r"\s+", " ", summary["paragraph2"]).strip())
-    if len(paragraph1) > 320:
-        paragraph1 = paragraph1[:317].rsplit(" ", 1)[0].rstrip(" ,؛:،") + "…"
-    if len(paragraph2) > 320:
-        paragraph2 = paragraph2[:317].rsplit(" ", 1)[0].rstrip(" ,؛:،") + "…"
-    if not (out_title and paragraph1 and paragraph2):
-        raise ValueError("Model returned an empty summary")
-    message = (
-        f"<b>{html.escape(out_title)}</b>\n\n"
-        f"{html.escape(paragraph1)}\n\n"
-        f"{html.escape(paragraph2)}\n\n"
-        f"<b>🆔 @pixelmediair</b>"
-    )
+    # Use the publisher's original headline; never let the model rewrite it.
+    message = build_telegram_caption(title, summary["paragraph1"], summary["paragraph2"])
     await telegram_send(session, BOT_TOKEN, DESTINATION, message, photo, image_mime_type)
     store.mark(link, source, "published")
     store.record_published(link, source, out_title.replace("\n", " "))
