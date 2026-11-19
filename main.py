@@ -9,7 +9,7 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import aiohttp
 import feedparser
@@ -41,6 +41,29 @@ FEEDS = {
 def normalize(value: str) -> str:
     value = unicodedata.normalize("NFKC", value or "").replace("ي", "ی").replace("ك", "ک")
     return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def canonical_url(value: str) -> str:
+    """Normalize tracking/query noise so URL variants of one article share a key."""
+    parts = urlsplit((value or "").strip())
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    port = f":{parts.port}" if parts.port and parts.port not in (80, 443) else ""
+    path = re.sub(r"/{2,}", "/", parts.path or "/").rstrip("/") or "/"
+    ignored = {"fbclid", "gclid", "dclid", "ref", "source"}
+    query = urlencode(sorted(
+        (key, val) for key, val in parse_qsl(parts.query, keep_blank_values=True)
+        if not key.lower().startswith("utm_") and key.lower() not in ignored
+    ))
+    scheme = "https" if parts.scheme.lower() in ("http", "https") else (parts.scheme.lower() or "https")
+    return urlunsplit((scheme, host + port, path, query, ""))
+
+
+def headline_key(value: str) -> str:
+    value = normalize(value)
+    value = re.sub(r"[^\w\d]+", " ", value, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def clean_html(value: str) -> str:
@@ -235,6 +258,7 @@ async def download_article_image(session: aiohttp.ClientSession, image_url: str)
     try:
         with Image.open(io.BytesIO(payload)) as original:
             image = ImageOps.exif_transpose(original)
+            image.thumbnail((2560, 2560), Image.Resampling.LANCZOS)
             if image.mode not in ("RGB", "L"):
                 rgba = image.convert("RGBA")
                 background = Image.new("RGB", rgba.size, "white")
@@ -243,7 +267,12 @@ async def download_article_image(session: aiohttp.ClientSession, image_url: str)
             elif image.mode == "L":
                 image = image.convert("RGB")
             output = io.BytesIO()
-            image.save(output, format="JPEG", quality=90, optimize=True)
+            image.save(output, format="JPEG", quality=88, optimize=True)
+            if output.tell() > 9 * 1024 * 1024:
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=75, optimize=True)
+            if output.tell() > 9 * 1024 * 1024:
+                raise ValueError("Converted image still exceeds Telegram's photo size limit")
             return output.getvalue(), "image/jpeg"
     except Exception as exc:
         raise ValueError(f"Could not decode the source article image: {exc}") from exc
@@ -254,6 +283,8 @@ class ProcessedStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS processed_web_articles (url TEXT PRIMARY KEY, source TEXT NOT NULL, status TEXT NOT NULL, processed_at TEXT DEFAULT CURRENT_TIMESTAMP)"
         )
@@ -262,6 +293,9 @@ class ProcessedStore:
         )
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS published_headlines (url TEXT PRIMARY KEY, source TEXT NOT NULL, title TEXT NOT NULL, published_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS published_title_keys (title_key TEXT PRIMARY KEY, url TEXT NOT NULL, source TEXT NOT NULL, title TEXT NOT NULL, published_at TEXT DEFAULT CURRENT_TIMESTAMP)"
         )
         self.db.commit()
 
@@ -280,21 +314,29 @@ class ProcessedStore:
 
     def contains(self, url: str) -> bool:
         return self.db.execute(
-            "SELECT 1 FROM processed_web_articles WHERE url = ?", (url,)
+            "SELECT 1 FROM processed_web_articles WHERE url = ?", (canonical_url(url),)
         ).fetchone() is not None
 
     def mark(self, url: str, source: str, status: str) -> None:
         self.db.execute(
             "INSERT OR IGNORE INTO processed_web_articles(url, source, status) VALUES (?, ?, ?)",
-            (url, source, status),
+            (canonical_url(url), source, status),
         )
         self.db.commit()
 
     def status_for(self, url: str) -> str | None:
         row = self.db.execute(
-            "SELECT status FROM processed_web_articles WHERE url = ?", (url,)
+            "SELECT status FROM processed_web_articles WHERE url = ?", (canonical_url(url),)
         ).fetchone()
         return str(row[0]) if row else None
+
+    def has_published_headline(self, title: str) -> bool:
+        key = headline_key(title)
+        if not key:
+            return False
+        return self.db.execute(
+            "SELECT 1 FROM published_title_keys WHERE title_key = ?", (key,)
+        ).fetchone() is not None
 
     def has_published_title(self, url: str) -> bool:
         return self.db.execute(
@@ -304,7 +346,23 @@ class ProcessedStore:
     def record_published(self, url: str, source: str, title: str) -> None:
         self.db.execute(
             "INSERT OR IGNORE INTO published_headlines(url, source, title) VALUES (?, ?, ?)",
-            (url, source, title[:240]),
+            (canonical_url(url), source, title[:240]),
+        )
+        key = headline_key(title)
+        if key:
+            self.db.execute(
+                "INSERT OR IGNORE INTO published_title_keys(title_key, url, source, title) VALUES (?, ?, ?, ?)",
+                (key, canonical_url(url), source, title[:240]),
+            )
+        self.db.commit()
+
+    def record_published_alias(self, url: str, source: str, title: str) -> None:
+        key = headline_key(title)
+        if not key:
+            return
+        self.db.execute(
+            "INSERT OR IGNORE INTO published_title_keys(title_key, url, source, title) VALUES (?, ?, ?, ?)",
+            (key, canonical_url(url), source, title[:240]),
         )
         self.db.commit()
 
@@ -398,11 +456,16 @@ async def process_entry(
     source: str,
     entry: Any,
 ) -> None:
-    link = str(entry.get("link", "")).strip()
+    link = canonical_url(str(entry.get("link", "")).strip())
     title = clean_html(str(entry.get("title", "")))
     if not link or not title or store.contains(link):
         return
     if not is_game_news(entry):
+        return
+    # Exact normalized headline dedup is deterministic and independent of the AI judgment.
+    if store.has_published_headline(title):
+        store.mark(link, source, "duplicate_title")
+        log.info("Skipped exact duplicate headline from %s: %s", source, title)
         return
 
     excerpt = article_text_from_feed(entry)
@@ -427,6 +490,10 @@ async def process_entry(
     # Leave paragraph wrapping to Telegram's client; only separate the two paragraphs.
     paragraph1 = re.sub(r"\s+", " ", summary["paragraph1"]).strip()
     paragraph2 = re.sub(r"\s+", " ", summary["paragraph2"]).strip()
+    if len(paragraph1) > 320:
+        paragraph1 = paragraph1[:317].rsplit(" ", 1)[0].rstrip(" ,؛:،") + "…"
+    if len(paragraph2) > 320:
+        paragraph2 = paragraph2[:317].rsplit(" ", 1)[0].rstrip(" ,؛:،") + "…"
     if not (out_title and paragraph1 and paragraph2):
         raise ValueError("Model returned an empty summary")
     message = (
@@ -438,6 +505,7 @@ async def process_entry(
     await telegram_send(session, BOT_TOKEN, DESTINATION, message, photo, image_mime_type)
     store.mark(link, source, "published")
     store.record_published(link, source, out_title.replace("\n", " "))
+    store.record_published_alias(link, source, title)
     log.info("Published game-news summary from %s: %s", source, title)
 
 
