@@ -157,15 +157,13 @@ def parse_summary(content: str) -> dict[str, Any]:
         raise ValueError("Model response must include boolean is_news and is_duplicate")
     if data["is_news"] is False or data["is_duplicate"] is True:
         return {"is_news": data["is_news"], "is_duplicate": data["is_duplicate"]}
-    title = str(data.get("title", "")).strip()
     p1 = str(data.get("paragraph1", "")).strip()
     p2 = str(data.get("paragraph2", "")).strip()
-    if not (title and p1 and p2):
-        raise ValueError("Model response must include title, paragraph1, and paragraph2")
+    if not (p1 and p2):
+        raise ValueError("Model response must include paragraph1 and paragraph2")
     return {
         "is_news": True,
         "is_duplicate": False,
-        "title": title,
         "paragraph1": p1,
         "paragraph2": p2,
     }
@@ -513,10 +511,9 @@ async def summarize(
         "آن را تکراری حساب کن. صرفاً یکسان بودن نام بازی یا شرکت به معنی تکراری بودن نیست؛ باید هستهٔ خبر "
         "یکی باشد. اگر تکراری است، خروجی فقط JSON معتبر {\"is_news\":true,\"is_duplicate\":true} باشد. "
         "اگر خبر نیست، خروجی فقط JSON معتبر {\"is_news\":false,\"is_duplicate\":false} باشد. "
-        "اگر خبر جدید است، خروجی JSON معتبر با is_news=true، is_duplicate=false، title، paragraph1 و "
-        "paragraph2 بده. خلاصه فارسی، کوتاه و غیرتکراری باشد؛ چیزی اختراع نکن و URL، هشتگ، ایموجی یا "
-        "قالب‌بندی را در مقادیر قرار نده. تیتر را روان، کوتاه و حداکثر حدود ۷۵ نویسه بنویس تا روی "
-        "موبایل در حداکثر دو خط جا شود؛ وسط واژه آن را قطع نکن.\n\n"
+        "اگر خبر جدید است، خروجی JSON معتبر با is_news=true، is_duplicate=false، paragraph1 و paragraph2 بده. "
+        "تیتر ننویس و بازنویسی نکن؛ تیتر اصلی ناشر عیناً استفاده می‌شود. خلاصهٔ فارسی کوتاه و غیرتکراری باشد؛ "
+        "چیزی اختراع نکن و URL، هشتگ، ایموجی یا قالب‌بندی را در بندها قرار نده.\n\n"
         f"تیترهای خبرهای منتشرشده در ۳۰ روز اخیر:\n{comparison_titles}\n\n"
         f"منبع: {source}\nعنوان مقالهٔ تازه: {title}\nمتن مقاله:\n{article[:12000]}"
     )
@@ -593,7 +590,8 @@ async def process_entry(
         log.info("Filtered non-news article from %s: %s", source, title)
         return
 
-    out_title = format_title(summary["title"], max_chars_per_line=40)
+    # Use the publisher's original headline; never let the model rewrite or duplicate it.
+    out_title = format_title(title, max_chars_per_line=40)
     # Leave paragraph wrapping to Telegram's client; only separate the two paragraphs.
     paragraph1 = re.sub(r"\s+", " ", summary["paragraph1"]).strip()
     paragraph2 = re.sub(r"\s+", " ", summary["paragraph2"]).strip()
