@@ -26,7 +26,7 @@ DESTINATION = os.getenv("DESTINATION_CHANNEL", "@pixelmediair")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 COARENA_API_KEY = os.getenv("COARENA_API_KEY", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/processed.sqlite3")
-POLL_INTERVAL_SECONDS = max(60, int(os.getenv("POLL_INTERVAL_SECONDS", "600")))
+POLL_INTERVAL_SECONDS = 60
 
 # Official public RSS feeds. Items pass a strict explicit game-news category check.
 FEEDS = {
@@ -373,7 +373,12 @@ async def main() -> None:
                 raise RuntimeError("BOT_TOKEN was rejected by Telegram Bot API")
             username = identity["result"].get("username", "unknown")
         log.info("Telegram bot authenticated as @%s; destination=%s", username, DESTINATION)
-        log.info("Monitoring %d RSS feeds with model %s", len(FEEDS), MODEL)
+        log.info(
+            "Monitoring %d RSS feeds every %d seconds with model %s",
+            len(FEEDS),
+            POLL_INTERVAL_SECONDS,
+            MODEL,
+        )
 
         while True:
             for source, feed_url in FEEDS.items():
