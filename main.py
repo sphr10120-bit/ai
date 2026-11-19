@@ -30,11 +30,14 @@ COARENA_API_KEY = os.getenv("COARENA_API_KEY", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/processed.sqlite3")
 POLL_INTERVAL_SECONDS = 60
 
-# Official public RSS feeds. Items pass a strict explicit game-news category check.
+# Public RSS, category-page, and site API sources. Items pass a gaming-news filter.
 FEEDS = {
     "Zoomg": "https://www.zoomg.ir/feed/",
     "Gamefa": "https://gamefa.com/feed/",
     "Vigiato": "https://vigiato.net/feed/",
+    "BaziCenter": "https://www.bazicenter.com/feed/",
+    "Par30Games": "https://par30games.net/mag/news/",
+    "MoonMedia": "https://moonmedia.ir/api/posts.php?action=list&type=news&page=1&limit=20",
 }
 
 
@@ -487,6 +490,72 @@ class ProcessedStore:
 
 
 async def fetch_feed(session: aiohttp.ClientSession, url: str) -> list[Any]:
+    if url == FEEDS["Par30Games"]:
+        async with session.get(url, allow_redirects=True) as response:
+            response.raise_for_status()
+            markup = await response.text(errors="ignore")
+        soup = BeautifulSoup(markup, "html.parser")
+        heading = next((h for h in soup.select("h1") if "اخبار بازی" in clean_html(h.get_text(" ", strip=True))), None)
+        section = heading.find_parent("section", class_="posts") if heading else None
+        if section is None:
+            raise ValueError("Could not locate Par30Games news listing")
+        entries: list[dict[str, Any]] = []
+        # The archive section contains only news cards; the AI classifier rejects hardware/movie items.
+        for card in section.select("article.post"):
+            heading_node = card.find(["h2", "h3"])
+            link_node = (heading_node.find("a", href=True) if heading_node else None) or card.find("a", href=True)
+            if not link_node:
+                continue
+            title = clean_html(str(link_node.get("title") or link_node.get_text(" ", strip=True)))
+            link = str(link_node.get("href", "")).strip()
+            if not title or not link:
+                continue
+            image = card.find("img")
+            image_url = str((image.get("data-src") or image.get("src")) if image else "").strip()
+            entries.append({
+                "title": title,
+                "link": link,
+                "summary": "<img src=\"" + html.escape(image_url, quote=True) + "\">" if image_url else "",
+                "tags": [{"term": "اخبار بازی"}],
+                "published_parsed": time.gmtime(0),
+            })
+        # The archive is newest-first. Preserve stable oldest-first processing downstream.
+        return list(reversed(entries))
+
+    if url == FEEDS["MoonMedia"]:
+        async with session.get(url, allow_redirects=True) as response:
+            response.raise_for_status()
+            data = await response.json(content_type=None)
+        if not data.get("success") or not isinstance(data.get("posts"), list):
+            raise ValueError("Moonmedia news API returned an unexpected response")
+        entries = []
+        for post in data["posts"]:
+            if not isinstance(post, dict) or post.get("status") != "published":
+                continue
+            raw_tags = post.get("tags", []) or []
+            tag_text = " ".join(str(tag) for tag in raw_tags).casefold()
+            if any(term in tag_text for term in ("فیلم و سریال", "tv series", "film", "cinema", "سینما", "انیمه")):
+                continue
+            slug = str(post.get("slug") or post.get("id") or "").strip()
+            title = clean_html(str(post.get("title", "")))
+            if not slug or not title:
+                continue
+            try:
+                published = time.strptime(str(post.get("date", "")), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                published = time.gmtime(0)
+            cover = str(post.get("cover", "")).strip()
+            entries.append({
+                "title": title,
+                "link": f"https://moonmedia.ir/post/{slug}",
+                "summary": clean_html(str(post.get("excerpt", ""))),
+                "tags": [{"term": "اخبار بازی"}],
+                "media_content": [{"url": cover}] if cover else [],
+                "published_parsed": published,
+                "_moon_id": str(post.get("id", "")),
+            })
+        return entries
+
     async with session.get(url, allow_redirects=True) as response:
         response.raise_for_status()
         raw = await response.read()
@@ -494,6 +563,18 @@ async def fetch_feed(session: aiohttp.ClientSession, url: str) -> list[Any]:
     if parsed.bozo and not parsed.entries:
         raise ValueError(f"Could not parse RSS feed: {url}")
     return list(parsed.entries)
+
+
+async def fetch_moonmedia_article(session: aiohttp.ClientSession, post_id: str, fallback: str) -> str:
+    url = f"https://moonmedia.ir/api/posts.php?action=get&id={post_id}"
+    async with session.get(url, allow_redirects=True) as response:
+        response.raise_for_status()
+        data = await response.json(content_type=None)
+    post = data.get("post") if data.get("success") else None
+    if not isinstance(post, dict):
+        raise ValueError("Moonmedia article API did not return the requested post")
+    body = clean_html(str(post.get("body", "")))
+    return body or fallback
 
 
 async def summarize(
@@ -579,7 +660,11 @@ async def process_entry(
         return
 
     excerpt = article_text_from_feed(entry)
-    article, page_image_url = await fetch_article_text(session, link, excerpt or title)
+    if entry.get("_moon_id"):
+        article = await fetch_moonmedia_article(session, str(entry["_moon_id"]), excerpt or title)
+        page_image_url = None
+    else:
+        article, page_image_url = await fetch_article_text(session, link, excerpt or title)
     image_url = page_image_url or image_url_from_entry(entry, link)
     if not image_url:
         store.mark(link, source, "no_image")
