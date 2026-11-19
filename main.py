@@ -106,6 +106,44 @@ def clip_lines(value: str, max_lines: int, max_chars: int) -> str:
     return "\n".join(lines[:max_lines])
 
 
+def format_title(value: str, max_chars_per_line: int = 40) -> str:
+    """Keep a Persian headline to two phone-friendly lines without cutting mid-word."""
+    words = re.sub(r"\s+", " ", value or "").strip().split()
+    if not words:
+        return ""
+    lines: list[str] = []
+    current = ""
+    truncated = False
+    for index, word in enumerate(words):
+        if len(word) > max_chars_per_line:
+            word = word[: max_chars_per_line - 1] + "…"
+            truncated = index < len(words) - 1
+        candidate = f"{current} {word}".strip()
+        if len(candidate) <= max_chars_per_line:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        if len(lines) == 2:
+            truncated = True
+            break
+        current = word
+    if current and len(lines) < 2:
+        lines.append(current)
+    elif current and len(lines) == 2:
+        truncated = True
+    if truncated and lines:
+        last = lines[-1].rstrip()
+        if not last.endswith("…"):
+            while len(last) >= max_chars_per_line:
+                shortened = last.rsplit(" ", 1)[0]
+                if shortened == last:
+                    shortened = last[:-1]
+                last = shortened.rstrip()
+            lines[-1] = last.rstrip(" ,؛:،") + "…"
+    return "\n".join(lines[:2])
+
+
 def parse_summary(content: str) -> dict[str, Any]:
     import json
 
@@ -477,7 +515,8 @@ async def summarize(
         "اگر خبر نیست، خروجی فقط JSON معتبر {\"is_news\":false,\"is_duplicate\":false} باشد. "
         "اگر خبر جدید است، خروجی JSON معتبر با is_news=true، is_duplicate=false، title، paragraph1 و "
         "paragraph2 بده. خلاصه فارسی، کوتاه و غیرتکراری باشد؛ چیزی اختراع نکن و URL، هشتگ، ایموجی یا "
-        "قالب‌بندی را در مقادیر قرار نده.\n\n"
+        "قالب‌بندی را در مقادیر قرار نده. تیتر را روان، کوتاه و حداکثر حدود ۷۵ نویسه بنویس تا روی "
+        "موبایل در حداکثر دو خط جا شود؛ وسط واژه آن را قطع نکن.\n\n"
         f"تیترهای خبرهای منتشرشده در ۳۰ روز اخیر:\n{comparison_titles}\n\n"
         f"منبع: {source}\nعنوان مقالهٔ تازه: {title}\nمتن مقاله:\n{article[:12000]}"
     )
@@ -554,7 +593,7 @@ async def process_entry(
         log.info("Filtered non-news article from %s: %s", source, title)
         return
 
-    out_title = clip_lines(summary["title"], max_lines=2, max_chars=60)
+    out_title = format_title(summary["title"], max_chars_per_line=40)
     # Leave paragraph wrapping to Telegram's client; only separate the two paragraphs.
     paragraph1 = re.sub(r"\s+", " ", summary["paragraph1"]).strip()
     paragraph2 = re.sub(r"\s+", " ", summary["paragraph2"]).strip()
