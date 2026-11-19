@@ -144,6 +144,12 @@ def format_title(value: str, max_chars_per_line: int = 40) -> str:
     return "\n".join(lines[:2])
 
 
+def isolate_latin_runs(value: str) -> str:
+    """Keep Latin names in their left-to-right order inside Persian RTL text."""
+    pattern = re.compile(r"[A-Za-z0-9]+(?:[ '\u2019.-][A-Za-z0-9]+)*")
+    return pattern.sub(lambda match: "\u2066" + match.group(0) + "\u2069", value or "")
+
+
 def parse_summary(content: str) -> dict[str, Any]:
     import json
 
@@ -591,10 +597,10 @@ async def process_entry(
         return
 
     # Use the publisher's original headline; never let the model rewrite or duplicate it.
-    out_title = format_title(title, max_chars_per_line=40)
+    out_title = isolate_latin_runs(format_title(title, max_chars_per_line=40))
     # Leave paragraph wrapping to Telegram's client; only separate the two paragraphs.
-    paragraph1 = re.sub(r"\s+", " ", summary["paragraph1"]).strip()
-    paragraph2 = re.sub(r"\s+", " ", summary["paragraph2"]).strip()
+    paragraph1 = isolate_latin_runs(re.sub(r"\s+", " ", summary["paragraph1"]).strip())
+    paragraph2 = isolate_latin_runs(re.sub(r"\s+", " ", summary["paragraph2"]).strip())
     if len(paragraph1) > 320:
         paragraph1 = paragraph1[:317].rsplit(" ", 1)[0].rstrip(" ,؛:،") + "…"
     if len(paragraph2) > 320:
