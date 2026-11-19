@@ -298,6 +298,74 @@ class ProcessedStore:
             "CREATE TABLE IF NOT EXISTS published_title_keys (title_key TEXT PRIMARY KEY, url TEXT NOT NULL, source TEXT NOT NULL, title TEXT NOT NULL, published_at TEXT DEFAULT CURRENT_TIMESTAMP)"
         )
         self.db.commit()
+        self._migrate_legacy_url_keys()
+
+    def _migrate_legacy_url_keys(self) -> None:
+        """Preserve old raw-URL state when canonical URL keys are introduced."""
+        rows = self.db.execute(
+            "SELECT url, source, status, processed_at FROM processed_web_articles"
+        ).fetchall()
+        normalized: dict[str, tuple[str, str, str]] = {}
+        rank = {"published": 100, "baseline": 90, "duplicate": 80,
+                "duplicate_title": 80, "filtered": 70, "no_image": 60}
+        changed = False
+        for raw_url, source, status, processed_at in rows:
+            key = canonical_url(str(raw_url))
+            changed |= key != raw_url or key in normalized
+            old = normalized.get(key)
+            candidate = (str(source), str(status), str(processed_at))
+            if old is None or rank.get(candidate[1], 0) > rank.get(old[1], 0):
+                normalized[key] = candidate
+        if changed:
+            with self.db:
+                self.db.execute("DELETE FROM processed_web_articles")
+                self.db.executemany(
+                    "INSERT INTO processed_web_articles(url, source, status, processed_at) VALUES (?, ?, ?, ?)",
+                    [(url, source, status, processed_at) for url, (source, status, processed_at) in normalized.items()],
+                )
+
+        headline_rows = self.db.execute(
+            "SELECT url, source, title, published_at FROM published_headlines"
+        ).fetchall()
+        canonical_headlines: dict[str, tuple[str, str, str]] = {}
+        headlines_changed = False
+        for raw_url, source, title, published_at in headline_rows:
+            key = canonical_url(str(raw_url))
+            headlines_changed |= key != raw_url or key in canonical_headlines
+            previous = canonical_headlines.get(key)
+            candidate = (str(source), str(title), str(published_at))
+            if previous is None or candidate[2] > previous[2]:
+                canonical_headlines[key] = candidate
+        if headlines_changed:
+            with self.db:
+                self.db.execute("DELETE FROM published_headlines")
+                self.db.executemany(
+                    "INSERT INTO published_headlines(url, source, title, published_at) VALUES (?, ?, ?, ?)",
+                    [(url, source, title, published_at) for url, (source, title, published_at) in canonical_headlines.items()],
+                )
+
+        # Older releases stored published headlines but did not maintain exact-title keys.
+        with self.db:
+            for url, source, title in self.db.execute(
+                "SELECT url, source, title FROM published_headlines"
+            ).fetchall():
+                key = headline_key(str(title))
+                if key:
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO published_title_keys(title_key, url, source, title) VALUES (?, ?, ?, ?)",
+                        (key, canonical_url(str(url)), str(source), str(title)[:240]),
+                    )
+
+        title_rows = self.db.execute("SELECT title_key, url FROM published_title_keys").fetchall()
+        if any(canonical_url(str(url)) != url for _, url in title_rows):
+            with self.db:
+                for title_key, raw_url in title_rows:
+                    self.db.execute(
+                        "UPDATE published_title_keys SET url = ? WHERE title_key = ?",
+                        (canonical_url(str(raw_url)), title_key),
+                    )
+        if changed or headlines_changed:
+            log.info("Migrated legacy article URLs to canonical keys; previous feed history preserved")
 
     def has_baseline(self, source: str) -> bool:
         return self.db.execute(
